@@ -1,0 +1,67 @@
+---
+- name: Provision Ubuntu control-plane VM via Multipass
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    vm_name: cks-control-plane
+    vm_cpus: "2"
+    vm_memory: "4G"
+    vm_disk: "20G"
+    vm_image: "22.04"
+    cloud_init_file: "{{ playbook_dir }}/cloud-init.yaml"
+    inventory_file: "{{ playbook_dir }}/inventory/hosts.ini"
+
+  tasks:
+    - name: Check existing Multipass VMs
+      ansible.builtin.command: multipass list --format json
+      register: mp_list
+      changed_when: false
+
+    - name: Record existing VM names
+      ansible.builtin.set_fact:
+        existing_vms: "{{ (mp_list.stdout | from_json).list | map(attribute='name') | list }}"
+
+    - name: Launch control-plane VM (skipped if it already exists)
+      ansible.builtin.command: >
+        multipass launch {{ vm_image }}
+        --name {{ vm_name }}
+        --cpus {{ vm_cpus }}
+        --memory {{ vm_memory }}
+        --disk {{ vm_disk }}
+        --cloud-init {{ cloud_init_file }}
+      when: vm_name not in existing_vms
+
+    - name: Wait until VM reports Running
+      ansible.builtin.command: multipass info {{ vm_name }} --format json
+      register: mp_info
+      changed_when: false
+      until: (mp_info.stdout | from_json).info[vm_name].state == "Running"
+      retries: 10
+      delay: 5
+
+    - name: Extract control-plane IP
+      ansible.builtin.set_fact:
+        control_plane_ip: "{{ (mp_info.stdout | from_json).info[vm_name].ipv4[0] }}"
+
+    - name: Show assigned IP
+      ansible.builtin.debug:
+        msg: "Control-plane VM IP: {{ control_plane_ip }}"
+
+    - name: Ensure inventory directory exists
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/inventory"
+        state: directory
+
+    - name: Write inventory file for later plays
+      ansible.builtin.copy:
+        dest: "{{ inventory_file }}"
+        content: |
+          [control_plane]
+          {{ vm_name }} ansible_host={{ control_plane_ip }} ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/cks_lab_key ansible_ssh_common_args='-o StrictHostKeyChecking=no'
+
+    - name: Wait for SSH to come up
+      ansible.builtin.wait_for:
+        host: "{{ control_plane_ip }}"
+        port: 22
+        timeout: 120
