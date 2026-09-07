@@ -1,0 +1,87 @@
+---
+- name: Initialize Kubernetes v1.34 Control Plane with Calico Policy Enforcement
+  hosts: control_plane
+  become: true
+  gather_facts: true
+  vars:
+    pod_cidr: "10.244.0.0/16"
+    control_plane_ip: "{{ ansible_host }}"
+    calico_version: "v3.28.0"
+
+  tasks:
+    - name: Check if Kubernetes control plane is already initialized
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: kubeadmin_conf
+
+    - name: Run kubeadm init targeting bridged interface
+      ansible.builtin.command: >
+        kubeadm init
+        --apiserver-advertise-address={{ control_plane_ip }}
+        --pod-network-cidr={{ pod_cidr }}
+        --kubernetes-version=v1.34.0
+      register: kubeadm_init_output
+      when: not kubeadmin_conf.stat.exists
+      failed_when: 
+        - kubeadm_init_output.rc != 0
+        - "'already exists' not in kubeadm_init_output.stderr"
+
+    - name: Create .kube folder for local administration
+      ansible.builtin.file:
+        path: "/home/ubuntu/.kube"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    - name: Copy cluster administrative config to user workspace
+      ansible.builtin.copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/ubuntu/.kube/config
+        remote_src: true
+        owner: ubuntu
+        group: ubuntu
+        mode: '0600'
+
+    - name: Generate fresh worker node token link
+      ansible.builtin.command: kubeadm token create --print-join-command
+      register: join_command_raw
+      changed_when: false
+
+    - name: Save join token payload securely to Mac project root
+      ansible.builtin.copy:
+        content: "{{ join_command_raw.stdout }}"
+        dest: "{{ playbook_dir }}/join_command.txt"
+      delegate_to: localhost
+      become: false
+
+    - name: Apply standard Tigera Calico Operator
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf create -f 
+        https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/tigera-operator.yaml
+      register: calico_operator
+      changed_when: "'created' in calico_operator.stdout"
+      failed_when:
+        - calico_operator.rc != 0
+        - "'already exists' not in calico_operator.stderr"
+
+    - name: Download Calico default resource configuration locally
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/custom-resources.yaml
+        dest: /tmp/custom-resources.yaml
+        mode: '0644'
+
+    - name: Patch Calico configuration to map 10.244.0.0/16 Pod IP space
+      ansible.builtin.replace:
+        path: /tmp/custom-resources.yaml
+        regexp: '192.168.0.0/16'
+        replace: "{{ pod_cidr }}"
+
+    - name: Apply patched multi-architecture Calico configuration
+      ansible.builtin.command: >
+        kubectl --kubeconfig=/etc/kubernetes/admin.conf create -f /tmp/custom-resources.yaml
+      register: calico_custom_apply
+      changed_when: "'created' in calico_custom_apply.stdout"
+      failed_when:
+        - calico_custom_apply.rc != 0
+        - "'already exists' not in calico_custom_apply.stderr"

@@ -1,0 +1,8 @@
+# Ignore local Ansible execution files and tokens
+.ansible_vault_pass
+join_command.txt
+*.log
+
+# Ignore local temporary inventory alterations
+inventory/hosts.ini.bak
+
