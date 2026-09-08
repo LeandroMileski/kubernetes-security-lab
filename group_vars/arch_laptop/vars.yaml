@@ -1,0 +1,2 @@
+# This explicitly binds your inventory's alias to your vault variable
+arch_laptop_ip: "192.168.1.160"

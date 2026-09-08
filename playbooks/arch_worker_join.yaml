@@ -1,0 +1,221 @@
+---
+- name: Bootstrap and join Arch Linux worker node to CKS lab cluster
+  hosts: arch_laptop
+  become: true
+  gather_facts: true
+
+  vars:
+    ansible_host: "{{ arch_laptop_ip }}"
+    ansible_user: defiant
+    ansible_password: "{{ arch_login_password }}"
+    ansible_sudo_pass: "{{ arch_sudo_password }}"
+    k8s_pinned_version: "v1.34.11"
+    control_plane_ip: "192.168.1.184"      # Mac's real LAN IP, pf-forwarded to the VM
+
+  tasks:
+
+    ## --- Swap: Arch/Omarchy's zram-generator recreates swap on every boot ---
+
+    - name: Disable swap immediately
+      ansible.builtin.command: swapoff -a
+      changed_when: true
+
+    - name: Mask zram swap generator so it doesn't return on reboot
+      ansible.builtin.systemd:
+        name: systemd-zram-setup@zram0.service
+        masked: true
+        enabled: false
+      failed_when: false   # fine if this unit doesn't exist on a different setup
+
+    ## --- OS-level prerequisites ---
+
+    - name: Load required Kubernetes kernel modules on boot
+      ansible.builtin.copy:
+        dest: /etc/modules-load.d/k8s.conf
+        mode: '0644'
+        content: |
+          overlay
+          br_netfilter
+
+    - name: Set sysctl parameters for container networking
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/k8s.conf
+        mode: '0644'
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+
+    - name: Reload sysctl properties immediately
+      ansible.builtin.command: sysctl --system
+      changed_when: true
+
+    ## --- Container runtime ---
+
+    - name: Install container runtime and CNI plugins via pacman
+      community.general.pacman:
+        name:
+          - containerd
+          - cni-plugins
+        state: present
+        update_cache: true
+
+    - name: Initialize clean containerd configuration
+      ansible.builtin.shell: |
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Patch containerd config to enforce SystemdCgroup driver
+      ansible.builtin.replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: Start and enable containerd
+      ansible.builtin.systemd:
+        name: containerd
+        state: started
+        enabled: true
+
+    ## --- Pinned kubeadm/kubelet (bypasses pacman's rolling-repo version skew) ---
+
+    - name: Check currently installed kubeadm version, if any
+      ansible.builtin.command: kubeadm version -o short
+      register: current_kubeadm_version
+      changed_when: false
+      failed_when: false
+
+    - name: Remove any pacman-managed kubeadm/kubelet that don't match pinned version
+      community.general.pacman:
+        name:
+          - kubeadm
+          - kubelet
+        state: absent
+      when: "k8s_pinned_version.split('.')[0:2] | join('.') not in current_kubeadm_version.stdout"
+
+    - name: Download pinned kubeadm binary
+      ansible.builtin.get_url:
+        url: "https://dl.k8s.io/{{ k8s_pinned_version }}/bin/linux/amd64/kubeadm"
+        dest: /usr/local/bin/kubeadm
+        mode: '0755'
+      when: "k8s_pinned_version.split('.')[0:2] | join('.') not in current_kubeadm_version.stdout"
+
+    - name: Download pinned kubelet binary
+      ansible.builtin.get_url:
+        url: "https://dl.k8s.io/{{ k8s_pinned_version }}/bin/linux/amd64/kubelet"
+        dest: /usr/local/bin/kubelet
+        mode: '0755'
+      when: "k8s_pinned_version.split('.')[0:2] | join('.') not in current_kubeadm_version.stdout"
+
+    - name: Install kubelet systemd service file (static content — upstream kubepkg URLs were removed)
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/kubelet.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=kubelet: The Kubernetes Node Agent
+          Documentation=https://kubernetes.io/docs/
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          ExecStart=/usr/local/bin/kubelet
+          Restart=always
+          StartLimitInterval=0
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Ensure kubelet drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/systemd/system/kubelet.service.d
+        state: directory
+        mode: '0755'
+
+    - name: Install kubeadm drop-in config for kubelet
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+        mode: '0644'
+        content: |
+          [Service]
+          Environment="KUBELET_KUBECONFIG_ARGS=--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf --kubeconfig=/etc/kubernetes/kubelet.conf"
+          Environment="KUBELET_CONFIG_ARGS=--config=/var/lib/kubelet/config.yaml"
+          EnvironmentFile=-/var/lib/kubelet/kubeadm-flags.env
+          EnvironmentFile=-/etc/default/kubelet
+          ExecStart=
+          ExecStart=/usr/local/bin/kubelet $KUBELET_KUBECONFIG_ARGS $KUBELET_CONFIG_ARGS $KUBELET_KUBEADM_ARGS $KUBELET_EXTRA_ARGS
+
+    - name: Reload systemd after service file changes
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable kubelet (will crash-loop until join completes — expected)
+      ansible.builtin.systemd:
+        name: kubelet
+        enabled: true
+
+    - name: Confirm pinned versions are actually in place
+      ansible.builtin.command: "{{ item }}"
+      register: version_check
+      changed_when: false
+      loop:
+        - "/usr/local/bin/kubeadm version -o short"
+        - "/usr/local/bin/kubelet --version"
+
+    - name: Show installed versions
+      ansible.builtin.debug:
+        msg: "{{ version_check.results | map(attribute='stdout') | list }}"
+
+    ## --- Full reset of any prior partial-join state (idempotent re-runs) ---
+
+    - name: Reset any previous broken kubeadm state
+      ansible.builtin.command: kubeadm reset --force
+      changed_when: true
+      failed_when: false
+
+    - name: Remove leftover kubelet config/PKI not always cleared by reset
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes/kubelet.conf
+        - /etc/kubernetes/bootstrap-kubelet.conf
+        - /etc/kubernetes/pki
+        - /etc/cni/net.d
+
+    - name: Restart containerd after cleanup
+      ansible.builtin.systemd:
+        name: containerd
+        state: restarted
+
+    ## --- Join the cluster ---
+
+    - name: Read local cluster join string and correct the entry point IP
+      ansible.builtin.set_fact:
+        join_command: >-
+          {{
+            lookup('file', 'join_command.txt')
+            | regex_replace('192\.168\.252\.[0-9]+', control_plane_ip)
+          }}
+      delegate_to: localhost
+      become: false
+
+    - name: Show the corrected join command for validation
+      ansible.builtin.debug:
+        msg: "Executing corrected join sequence: {{ join_command }}"
+
+    - name: Execute kubeadm join routine (5-minute cap, verbose for visibility)
+      ansible.builtin.command: "timeout 320 {{ join_command }} -v=5"
+      register: worker_join_out
+      changed_when: "worker_join_out.stdout is defined and 'This node has joined the cluster' in worker_join_out.stdout"
+      failed_when: >
+        worker_join_out.rc is defined and
+        worker_join_out.rc != 0 and
+        (worker_join_out.stderr is not defined or 'already exists' not in worker_join_out.stderr)
+
+    - name: Show join output
+      ansible.builtin.debug:
+        var: worker_join_out.stdout_lines

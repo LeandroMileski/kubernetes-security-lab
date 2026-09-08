@@ -13,14 +13,11 @@
     inventory_file: "{{ playbook_dir }}/inventory/hosts.ini"
 
   tasks:
-    - name: Check existing Multipass VMs
-      ansible.builtin.command: multipass list --format json
-      register: mp_list
-      changed_when: false
-
-    - name: Record existing VM names
-      ansible.builtin.set_fact:
-        existing_vms: "{{ (mp_list.stdout | from_json).list | map(attribute='name') | list }}"
+    - name: Purge existing isolated Multipass VM instance
+      ansible.builtin.shell: |
+        multipass delete {{ vm_name }} || true
+        multipass purge
+      changed_when: true
 
     - name: Launch control-plane VM (bridged to physical network)
       ansible.builtin.command: >
